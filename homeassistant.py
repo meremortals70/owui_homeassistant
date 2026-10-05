@@ -3,23 +3,23 @@ title: Home Assistant
 author: lexiismadd
 author_url: https://github.com/lexiismadd
 funding_url: https://github.com/open-webui
-version: 2.0.0
+version: 2.0.1
 license: MIT
 requirements: aiohttp, loguru
 description: Home Assistant tool with smart area-prioritized entity detection and intelligent matching.
 """
-
+ 
 import asyncio
 import difflib
 import json
 import re
 from typing import Any, Callable, Optional
-
+ 
 import aiohttp
 from loguru import logger
 from pydantic import BaseModel, Field
-
-
+ 
+ 
 class Tools:
     class Valves(BaseModel):
         HA_URL: str = Field(
@@ -54,39 +54,45 @@ class Tools:
             default=0.5,
             description="Minimum score (0-1) for global search fallback to be considered a valid match.",
         )
-
+ 
     def __init__(self):
         self.valves = self.Valves()
         self._ws = None
+        self._ws_session = None
         self._ws_message_id = 0
         self._entity_cache = None
         self._area_cache = None
         self._known_areas = None  # Cache for area names
         logger.info("Home Assistant tool initialized")
-
+ 
     # =========================================================================
     # WebSocket Connection Management
     # =========================================================================
-
+ 
     async def _get_ws_connection(self):
         """Get or create a WebSocket connection to Home Assistant."""
         if self.valves.USE_WEBSOCKET:
             if self._ws is None or self._ws.closed:
                 ws_url = f"{self.valves.HA_URL.rstrip('/')}/api/websocket"
-                async with aiohttp.ClientSession() as session:
-                    self._ws = await session.ws_connect(ws_url)
-                    # Authenticate
-                    auth_msg = await self._ws.receive_json()
-                    if auth_msg["type"] == "auth_required":
-                        await self._ws.send_json({
-                            "type": "auth",
-                            "access_token": self.valves.HA_TOKEN
-                        })
-                        auth_result = await self._ws.receive_json()
-                        if auth_result["type"] != "auth_ok":
-                            raise Exception("WebSocket authentication failed")
+                # Keep the ClientSession open for the lifetime of the WebSocket.
+                # Creating it in an "async with" block closed the session (and the
+                # socket's transport) as soon as authentication finished, so every
+                # later command failed with "Cannot write to closing transport".
+                if self._ws_session is None or self._ws_session.closed:
+                    self._ws_session = aiohttp.ClientSession()
+                self._ws = await self._ws_session.ws_connect(ws_url)
+                # Authenticate
+                auth_msg = await self._ws.receive_json()
+                if auth_msg["type"] == "auth_required":
+                    await self._ws.send_json({
+                        "type": "auth",
+                        "access_token": self.valves.HA_TOKEN
+                    })
+                    auth_result = await self._ws.receive_json()
+                    if auth_result["type"] != "auth_ok":
+                        raise Exception("WebSocket authentication failed")
         return self._ws
-
+ 
     async def _ws_send_command(self, command: dict, timeout: float = 10.0) -> dict:
         """Send a command via WebSocket and wait for response."""
         ws = await self._get_ws_connection()
@@ -102,17 +108,20 @@ class Tools:
             # Handle event messages differently
             if response.get("type") == "event":
                 continue
-
+ 
     async def close_ws(self):
         """Close WebSocket connection."""
         if self._ws and not self._ws.closed:
             await self._ws.close()
             self._ws = None
-
+        if self._ws_session is not None and not self._ws_session.closed:
+            await self._ws_session.close()
+            self._ws_session = None
+ 
     # =========================================================================
     # REST API Helper
     # =========================================================================
-
+ 
     async def _make_request(
         self,
         method: str,
@@ -122,13 +131,13 @@ class Tools:
         """Make an authenticated request to Home Assistant API."""
         if not self.valves.HA_URL or not self.valves.HA_TOKEN:
             raise ValueError("Home Assistant URL and Token must be configured in valves")
-
+ 
         url = f"{self.valves.HA_URL.rstrip('/')}/api/{endpoint.lstrip('/')}"
         headers = {
             "Authorization": f"Bearer {self.valves.HA_TOKEN}",
             "Content-Type": "application/json",
         }
-
+ 
         async with aiohttp.ClientSession() as session:
             try:
                 if method.upper() == "GET":
@@ -141,17 +150,17 @@ class Tools:
                         return await response.json()
             except aiohttp.ClientError as e:
                 raise Exception(f"Home Assistant API request failed: {str(e)}")
-
+ 
     # =========================================================================
     # Entity and Area Discovery
     # =========================================================================
-
+ 
     async def _fetch_all_entities(self) -> list[dict]:
         """Fetch all entities from Home Assistant via REST API."""
         states = await self._make_request("GET", "states")
         entities = self._filter_entities(states)
         return entities
-
+ 
     async def _fetch_areas_via_websocket(self) -> list[dict]:
         """Fetch areas via WebSocket for room/area detection."""
         try:
@@ -161,7 +170,7 @@ class Tools:
         except Exception as e:
             logger.warning(f"Failed to fetch areas via WebSocket: {e}")
         return []
-
+ 
     async def _fetch_entity_registry_via_websocket(self) -> list[dict]:
         """Fetch entity registry via WebSocket to get area associations."""
         try:
@@ -171,15 +180,15 @@ class Tools:
         except Exception as e:
             logger.warning(f"Failed to fetch entity registry via WebSocket: {e}")
         return []
-
+ 
     async def _build_entity_map(self) -> dict:
         """Build a comprehensive map of entities with area info from all sources."""
         if self._entity_cache is not None:
             return self._entity_cache
-
+ 
         # Fetch entities via REST
         entities = await self._fetch_all_entities()
-
+ 
         # If using WebSocket, enrich with area info
         area_info = {}
         entity_registry = []
@@ -204,7 +213,7 @@ class Tools:
                         }
             except Exception as e:
                 logger.warning(f"WebSocket enrichment failed: {e}")
-
+ 
         # Build entity map
         entity_map = {}
         for entity in entities:
@@ -228,15 +237,15 @@ class Tools:
                 "domain": entity_id.split(".")[0] if "." in entity_id else "",
                 "entity_name": entity_id.split(".")[1] if "." in entity_id else entity_id,
             }
-
+ 
         self._entity_cache = entity_map
         return entity_map
-
+ 
     async def _get_known_areas(self) -> dict:
         """Get dictionary of known areas (name -> area_id)."""
         if self._known_areas is not None:
             return self._known_areas
-
+ 
         entity_map = await self._build_entity_map()
         
         # Build area list from entity map
@@ -249,7 +258,7 @@ class Tools:
                     "area_id": area_id,
                     "area_name": area_name,
                 }
-
+ 
         # Also try to fetch areas via WebSocket for comprehensive list
         if self.valves.USE_WEBSOCKET:
             try:
@@ -264,53 +273,53 @@ class Tools:
                         }
             except Exception as e:
                 logger.warning(f"Could not fetch additional areas: {e}")
-
+ 
         self._known_areas = areas
         return areas
-
+ 
     def _invalidate_cache(self):
         """Invalidate entity cache to force refresh."""
         self._entity_cache = None
         self._area_cache = None
         self._known_areas = None
         self._entity_words_cache = None
-
+ 
     # =========================================================================
     # Entity Filtering
     # =========================================================================
-
+ 
     def _matches_pattern(self, entity_id: str, patterns: list[str]) -> bool:
         """Check if entity_id matches any of the patterns (supports wildcards)."""
         if not patterns:
             return False
         return any(fnmatch.fnmatch(entity_id, pattern.strip()) for pattern in patterns)
-
+ 
     def _filter_entities(self, entities: list[dict]) -> list[dict]:
         """Filter entities based on domain, included, and excluded patterns."""
         domains = [d.strip() for d in self.valves.DISCOVER_DOMAINS.split(",") if d.strip()]
         included = [p.strip() for p in self.valves.INCLUDED_ENTITIES.split(",") if p.strip()]
         excluded = [p.strip() for p in self.valves.EXCLUDED_ENTITIES.split(",") if p.strip()]
-
+ 
         filtered = []
         for entity in entities:
             entity_id = entity.get("entity_id", "")
             domain = entity_id.split(".")[0] if "." in entity_id else ""
-
+ 
             if domain not in domains:
                 continue
             if excluded and self._matches_pattern(entity_id, excluded):
                 continue
             if included and not self._matches_pattern(entity_id, included):
                 continue
-
+ 
             filtered.append(entity)
-
+ 
         return filtered
-
+ 
     # =========================================================================
     # Area Detection from Query
     # =========================================================================
-
+ 
     def _extract_potential_area_mentions(self, query: str) -> list[str]:
         """
         Extract potential area mentions from the query.
@@ -356,7 +365,7 @@ class Tools:
                     potential_areas.append(area)
         
         return potential_areas
-
+ 
     async def _detect_area_from_query(self, query: str) -> tuple[Optional[dict], float]:
         """
         Detect which area (if any) the user is referring to in their query.
@@ -421,11 +430,11 @@ class Tools:
         
         logger.info(f"No area detected (best score: {best_score:.2f})")
         return None, 0.0
-
+ 
     # =========================================================================
     # Entity Matching
     # =========================================================================
-
+ 
     def _extract_device_name(self, user_request: str) -> str:
         """
         Extract the device/location name from user request.
@@ -439,6 +448,11 @@ class Tools:
         
         # Action words and patterns to remove
         action_patterns = [
+            # Strip "turn on/off" and "switch on/off" first. Otherwise the generic
+            # pattern below removes only "turn", and the location pattern then
+            # treats "on <name> lights" as a location phrase and deletes the device
+            # name entirely ("turn on desk lights" -> "").
+            r"^(turn|switch)\s+(on|off)\s+",
             r"^(turn|switch|set|get|check|what's|whats|what is|is the|are the)\s+",
             r"\s+(on|off|up|down|to|in|at|for)$",
             r"\s+(on|off|up|down)$",
@@ -459,7 +473,7 @@ class Tools:
         device_name = " ".join(words)
         
         return device_name
-
+ 
     def _generate_entity_candidates(self, device_name: str) -> list[str]:
         """
         Generate possible entity_id patterns from a device name.
@@ -535,7 +549,7 @@ class Tools:
                 candidates.add(base)
         
         return list(candidates)
-
+ 
     def _calculate_match_score(self, request_words: list[str], entity_info: dict) -> float:
         """
         Calculate match score between user request and entity.
@@ -549,28 +563,28 @@ class Tools:
         """
         if not request_words:
             return 0.0
-
+ 
         entity_id = entity_info.get("entity_id", "").lower()
         friendly_name = entity_info.get("friendly_name", "").lower()
         area_name = entity_info.get("area_name", "").lower()
         entity_name = entity_info.get("entity_name", "").lower()
         domain = entity_info.get("domain", "").lower()
-
+ 
         # Preprocess entity parts
         entity_id_words = entity_id.replace(".", " ").replace("_", " ").split()
         friendly_words = friendly_name.replace(".", " ").replace("_", " ").split()
         area_words = area_name.replace(".", " ").replace("_", " ").split() if area_name else []
-
+ 
         # Calculate word overlap ratios
         request_set = set(request_words)
         friendly_set = set(friendly_words)
         entity_set = set(entity_id_words)
         area_set = set(area_words)
-
+ 
         overlap_friendly = len(request_set & friendly_set) / max(len(request_set), 1)
         overlap_entity = len(request_set & entity_set) / max(len(request_set), 1)
         overlap_area = len(request_set & area_set) / max(len(request_set), 1) if area_set else 0
-
+ 
         # Build candidate entity_ids and check for matches
         device_name = " ".join(request_words)
         candidates = self._generate_entity_candidates(device_name)
@@ -586,7 +600,7 @@ class Tools:
                 candidate_match = max(candidate_match, 0.7)
             ratio = difflib.SequenceMatcher(None, candidate, entity_name).ratio()
             candidate_match = max(candidate_match, ratio * 0.6)
-
+ 
         # Check if request words match area + device pattern
         area_device_match = 0.0
         for req_word in request_words:
@@ -597,7 +611,7 @@ class Tools:
                     for rw in remaining_words:
                         if rw in entity_id_words or rw in friendly_words:
                             area_device_match = 0.8
-
+ 
         # Combine scores with weights
         combined_score = (
             overlap_friendly * 0.25 +
@@ -606,9 +620,9 @@ class Tools:
             candidate_match * 0.30 +
             area_device_match * 0.10
         )
-
+ 
         return min(combined_score, 1.0)
-
+ 
     def _score_entities(self, entities: dict, request_words: list[str]) -> list[dict]:
         """
         Score all entities and return sorted list.
@@ -628,10 +642,10 @@ class Tools:
                     "domain": entity_info["domain"],
                     "score": score,
                 })
-
+ 
         scored_entities.sort(key=lambda x: x["score"], reverse=True)
         return scored_entities
-
+ 
     async def _find_matching_entities(
         self, 
         user_request: str, 
@@ -653,7 +667,7 @@ class Tools:
         
         logger.info(f"Extracted device name: '{device_name}' from request: '{user_request}'")
         logger.info(f"Request words: {request_words}")
-
+ 
         # Stage 1: Area-constrained search (if area detected)
         if area_constraint:
             area_name = area_constraint["area_name"]
@@ -699,38 +713,38 @@ class Tools:
                 return scored_entities, "global_fallback"
         
         return scored_entities, "global"
-
+ 
     # =========================================================================
     # Response Formatting
     # =========================================================================
-
+ 
     def _format_entity_for_llm(self, entity: dict) -> dict:
         """Format entity information for LLM understanding."""
         entity_id = entity.get("entity_id", "")
         attributes = entity.get("attributes", {})
         state = entity.get("state", "unknown")
-
+ 
         domain = entity_id.split(".")[0] if "." in entity_id else ""
-
+ 
         info = {
             "entity_id": entity_id,
             "domain": domain,
             "friendly_name": attributes.get("friendly_name", entity_id),
             "state": state,
         }
-
+ 
         # Add area/room if available
         if "area_name" in attributes:
             info["area"] = attributes["area_name"]
-
+ 
         # Add device class for sensors
         if "device_class" in attributes:
             info["device_class"] = attributes["device_class"]
-
+ 
         # Add unit of measurement for sensors
         if "unit_of_measurement" in attributes:
             info["unit"] = attributes["unit_of_measurement"]
-
+ 
         # Add relevant domain-specific attributes
         if domain == "light" and state == "on":
             if "brightness" in attributes:
@@ -743,16 +757,16 @@ class Tools:
         elif domain == "cover":
             if "current_position" in attributes:
                 info["position"] = attributes["current_position"]
-
+ 
         return info
-
+ 
     def _explain_match(self, match: dict, user_request: str, search_method: str, detected_area: Optional[str] = None) -> str:
         """Explain why this entity was matched."""
         score = match["score"]
         friendly = match["friendly_name"]
         area = match["area_name"]
         entity_id = match["entity_id"]
-
+ 
         explanations = []
         
         if search_method == "area_priority" and detected_area:
@@ -771,13 +785,13 @@ class Tools:
             explanations.append("Best available match found")
         else:
             explanations.append("Match found via fuzzy search")
-
+ 
         return "; ".join(explanations) if explanations else "Entity found in Home Assistant"
-
+ 
     # =========================================================================
     # Main Tool Functions
     # =========================================================================
-
+ 
     async def control_home_assistant(
         self,
         user_request: str,
@@ -785,17 +799,17 @@ class Tools:
     ) -> str:
         """
         [PRIMARY FUNCTION] Control or query Home Assistant based on natural language request.
-
+ 
         This function uses smart entity detection with area-prioritized search. When you mention
         a room or area in your request, it first looks for matching devices in that area. Only
         if no suitable match is found there does it expand the search to your entire home.
-
+ 
         Examples:
         - "turn on the toilet light" -> Detects "light.toilet_light" via global search
         - "turn on kitchen lights" -> First searches Kitchen area, finds "light.kitchen_leds"
         - "dim the bedroom lights" -> First searches Bedroom area, finds "light.bedroom_ceiling"
         - "what's the temperature in the hallway" -> First searches Hallway area, finds sensor
-
+ 
         :param user_request: Natural language request (e.g., "turn on toilet light", "what's the temperature")
         :return: JSON object with matching entities and search metadata
         """
@@ -804,7 +818,7 @@ class Tools:
                 "error": "NOT_CONFIGURED",
                 "message": "Home Assistant is not configured. Please set HA_URL and HA_TOKEN in the tool valves."
             }
-
+ 
         try:
             if __event_emitter__:
                 await __event_emitter__(
@@ -813,11 +827,11 @@ class Tools:
                         "data": {"description": "Fetching Home Assistant entities...", "done": False},
                     }
                 )
-
+ 
             # Build entity map with area info
             entity_map = await self._build_entity_map()
             logger.info(f"Loaded {len(entity_map)} entities from Home Assistant")
-
+ 
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -825,7 +839,7 @@ class Tools:
                         "data": {"description": "Detecting area from request...", "done": False},
                     }
                 )
-
+ 
             # Detect area from query
             detected_area, area_confidence = await self._detect_area_from_query(user_request)
             
@@ -833,7 +847,7 @@ class Tools:
                 logger.info(f"Area detected: {detected_area['area_name']} (confidence: {area_confidence:.2f})")
             else:
                 logger.info("No area detected in query")
-
+ 
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -841,14 +855,14 @@ class Tools:
                         "data": {"description": "Finding matching entities...", "done": False},
                     }
                 )
-
+ 
             # Find matching entities with area-prioritized search
             scored_entities, search_method = await self._find_matching_entities(
                 user_request, 
                 entity_map,
                 area_constraint=detected_area
             )
-
+ 
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -856,10 +870,10 @@ class Tools:
                         "data": {"description": "Analyzing results...", "done": False},
                     }
                 )
-
+ 
             # Format top matches for LLM
             top_matches = scored_entities[:20]
-
+ 
             # Group by domain
             by_domain = {}
             for item in top_matches:
@@ -874,7 +888,7 @@ class Tools:
                     "state": entity.get("state", "unknown"),
                     "match_score": round(item["score"], 3),
                 })
-
+ 
             # Build response
             if len(top_matches) == 0:
                 result = {
@@ -922,7 +936,7 @@ class Tools:
                         best_match, user_request, search_method, detected_area_name
                     ),
                 }
-
+ 
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -930,9 +944,9 @@ class Tools:
                         "data": {"description": f"Found {len(top_matches)} matching entities", "done": True},
                     }
                 )
-
+ 
             return result
-
+ 
         except Exception as e:
             error_msg = f"Error processing Home Assistant request: {str(e)}"
             logger.error(error_msg)
@@ -940,7 +954,7 @@ class Tools:
                 "error": "EXCEPTION",
                 "message": error_msg
             }
-
+ 
     def _get_search_method_explanation(
         self, 
         search_method: str, 
@@ -963,7 +977,7 @@ class Tools:
                 "Global search: No specific area was detected in your request, so I searched "
                 "all devices in your home."
             )
-
+ 
     async def execute_action(
         self,
         action_type: str,
@@ -975,18 +989,18 @@ class Tools:
     ) -> str:
         """
         Execute an action on Home Assistant after getting context from control_home_assistant().
-
+ 
         IMPORTANT: You must use the EXACT entity_id from control_home_assistant() response.
         Do NOT guess, truncate, or modify the entity_id in any way.
-
+ 
         Examples of CORRECT usage:
         - If context shows "light.hallway_light" -> Use "light.hallway_light" ✓
         - If context shows "light.toilet_light" -> Use "light.toilet_light" ✓
-
+ 
         Examples of INCORRECT usage:
         - Context shows "light.hallway_light" but you use "light.hallway" ✗
         - Context shows "sensor.living_room_temperature" but you use "sensor.living_room" ✗
-
+ 
         :param action_type: Either "get_state" or "call_service"
         :param entity_id: EXACT entity_id from control_home_assistant() - no modifications!
         :param service: Service name if action_type is "call_service" (e.g., "turn_on", "turn_off", "toggle")
@@ -999,7 +1013,7 @@ class Tools:
                 "error": "NOT_CONFIGURED",
                 "message": "Home Assistant is not configured."
             }
-
+ 
         # Helper function to format responses
         def format_ha_response(raw_response: dict) -> str:
             """Clean and summarize Home Assistant tool output for display."""
@@ -1009,7 +1023,7 @@ class Tools:
             entity_id_response = raw_response.get("entity_id")
             entity_name = raw_response.get("friendly_name", entity_id_response)
             message = raw_response.get("result", "")
-
+ 
             if service_name in ["turn_on", "turn_off"]:
                 return f"{entity_name} turned {service_name.replace('_', ' ')}."
             elif service_name in ["toggle"]:
@@ -1019,9 +1033,9 @@ class Tools:
             elif message:
                 cleaned = re.sub(r"Successfully called \S+ on ", "", message)
                 return f"{entity_name} updated." if not cleaned else cleaned
-
+ 
             return f"Action {service_name} executed on {entity_name}."
-
+ 
         try:
             result = {
                 "success": False,
@@ -1033,7 +1047,7 @@ class Tools:
                 "result": "",
                 "message": ""
             }
-
+ 
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -1041,23 +1055,23 @@ class Tools:
                         "data": {"description": f"{str(action_type).replace('_', ' ').capitalize()} {f'{service} ' if service else ''}on {entity_id}...", "done": False},
                     }
                 )
-
+ 
             # Validate entity_id format
             if "." not in entity_id:
                 return {
                     "error": "INVALID_ENTITY_ID",
                     "message": f"Invalid entity_id format: {entity_id}. Must be 'domain.entity_name'"
                 }
-
+ 
             domain = entity_id.split(".")[0]
-
+ 
             if action_type == "call_service":
                 if not service:
                     return {
                         "error": "MISSING_PARAMETER",
                         "message": "service parameter is required when action_type is 'call_service'"
                     }
-
+ 
                 # Verify entity exists
                 try:
                     entity = await self._make_request("GET", f"states/{entity_id}")
@@ -1067,7 +1081,7 @@ class Tools:
                     if "404" in str(api_error) or "Not Found" in str(api_error):
                         return await self._handle_entity_not_found(entity_id)
                     raise
-
+ 
                 if __event_emitter__:
                     await __event_emitter__(
                         {
@@ -1075,10 +1089,10 @@ class Tools:
                             "data": {"description": f"Calling {service} on {friendly_name}...", "done": False},
                         }
                     )
-
+ 
                 # Prepare service data
                 service_data = {"entity_id": entity_id}
-
+ 
                 # Parse additional data if provided
                 if additional_data:
                     try:
@@ -1089,7 +1103,7 @@ class Tools:
                             "error": "INVALID_JSON",
                             "message": f"Invalid JSON in additional_data: {additional_data}"
                         }
-
+ 
                 # Call the service
                 try:
                     await self._make_request(
@@ -1101,7 +1115,7 @@ class Tools:
                     if "404" in str(api_error) or "Not Found" in str(api_error):
                         return await self._handle_entity_not_found(entity_id)
                     raise
-
+ 
                 result["success"] = True
                 result["domain"] = domain
                 result["service"] = service
@@ -1109,10 +1123,10 @@ class Tools:
                 result["entity_id"] = entity_id
                 result["result"] = f"Successfully called {service} on {domain} {friendly_name}"
                 result["message"] = format_ha_response(result)
-
+ 
                 if additional_data:
                     result["parameters"] = json.loads(additional_data)
-
+ 
                 if __event_emitter__:
                     await __event_emitter__(
                         {
@@ -1120,14 +1134,14 @@ class Tools:
                             "data": {"description": f"Successfully executed {service} on {friendly_name}", "done": True},
                         }
                     )
-
+ 
                 logger.info(f"Called {domain}.{service} on {entity_id}")
-
+ 
                 # If this was a state-changing action, get the updated state
                 if service in ["turn_on", "turn_off", "toggle", "set_temperature", "set_brightness"]:
                     await asyncio.sleep(1.5)  # Wait for state to update
                     action_type = "get_state"
-
+ 
             if action_type == "get_state":
                 if __event_emitter__:
                     await __event_emitter__(
@@ -1136,7 +1150,7 @@ class Tools:
                             "data": {"description": f"Getting state for {friendly_name if friendly_name else entity_id}...", "done": False},
                         }
                     )
-
+ 
                 try:
                     entity = await self._make_request("GET", f"states/{entity_id}")
                     friendly_name = entity.get("attributes", {}).get("friendly_name", entity_id) if not friendly_name else friendly_name
@@ -1146,7 +1160,7 @@ class Tools:
                     if "404" in str(api_error) or "Not Found" in str(api_error):
                         return await self._handle_entity_not_found(entity_id)
                     raise
-
+ 
                 result["success"] = True
                 result["domain"] = domain
                 result["friendly_name"] = friendly_name
@@ -1154,7 +1168,7 @@ class Tools:
                 result["last_changed"] = entity.get("last_changed", "unknown")
                 result["last_updated"] = entity.get("last_updated", "unknown")
                 result["attributes"] = attributes
-
+ 
                 if __event_emitter__:
                     await __event_emitter__(
                         {
@@ -1162,17 +1176,17 @@ class Tools:
                             "data": {"description": f"Retrieved state for {friendly_name}: {state}", "done": True},
                         }
                     )
-
+ 
                 logger.info(f"Retrieved state for {entity_id}")
-
+ 
             else:
                 return {
                     "error": "INVALID_ACTION_TYPE",
                     "message": f"Invalid action_type: {action_type}. Must be 'get_state' or 'call_service'"
                 }
-
+ 
             return result
-
+ 
         except Exception as e:
             error_msg = f"Error executing action: {str(e)}"
             logger.error(error_msg)
@@ -1180,15 +1194,15 @@ class Tools:
                 "error": "EXCEPTION",
                 "message": error_msg
             }
-
+ 
     async def _handle_entity_not_found(self, attempted_entity_id: str) -> dict:
         """Handle entity not found errors with smart suggestions."""
         logger.warning(f"Entity not found: {attempted_entity_id}")
-
+ 
         # Extract domain and attempted name
         domain = attempted_entity_id.split(".")[0] if "." in attempted_entity_id else ""
         attempted_name = attempted_entity_id.split(".")[1] if "." in attempted_entity_id else attempted_entity_id
-
+ 
         # Get fresh entity map
         try:
             entity_map = await self._build_entity_map()
@@ -1205,16 +1219,16 @@ class Tools:
                 friendly_name = entity_info["friendly_name"]
                 entity_name = entity_info["entity_name"]
                 area_name = entity_info["area_name"]
-
+ 
                 # Calculate multiple similarity scores
                 name_similarity = difflib.SequenceMatcher(None, attempted_name.lower(), entity_name.lower()).ratio()
                 friendly_similarity = difflib.SequenceMatcher(None, attempted_name.lower(), friendly_name.lower()).ratio()
                 area_similarity = difflib.SequenceMatcher(None, attempted_name.lower(), area_name.lower()).ratio() if area_name else 0
-
+ 
                 # Check for substring matches
                 substring_bonus = 0.2 if attempted_name.lower() in entity_name.lower() else 0
                 reverse_substring = 0.15 if entity_name.lower() in attempted_name.lower() else 0
-
+ 
                 # Combined score with weights
                 combined_score = max(
                     name_similarity * 0.5 + friendly_similarity * 0.3 + area_similarity * 0.1 + substring_bonus + reverse_substring,
@@ -1222,7 +1236,7 @@ class Tools:
                     friendly_similarity,
                     area_similarity
                 )
-
+ 
                 if combined_score > 0.3:
                     candidates.append({
                         "entity_id": entity_id,
@@ -1230,10 +1244,10 @@ class Tools:
                         "area": area_name,
                         "similarity_score": round(combined_score, 2),
                     })
-
+ 
             # Sort by similarity
             candidates.sort(key=lambda x: x["similarity_score"], reverse=True)
-
+ 
             if candidates:
                 return {
                     "error": "ENTITY_NOT_FOUND",
@@ -1259,7 +1273,7 @@ class Tools:
                     },
                     "warning": "DO NOT guess entity_ids. You MUST call control_home_assistant() again.",
                 }
-
+ 
         except Exception as e:
             return {
                 "error": "ENTITY_NOT_FOUND",
@@ -1271,7 +1285,7 @@ class Tools:
                 },
                 "warning": "You MUST call control_home_assistant() again.",
             }
-
+ 
     async def validate_connection(self) -> dict:
         """
         Validate the Home Assistant connection when valves are saved.
@@ -1282,17 +1296,17 @@ class Tools:
                 "status": "not_configured",
                 "message": "Home Assistant URL and Token are not configured. Please configure them to enable the tool."
             }
-
+ 
         try:
             # Test REST API
             config = await self._make_request("GET", "config")
             states = await self._make_request("GET", "states")
             filtered = self._filter_entities(states)
-
+ 
             # Get known areas
             known_areas = await self._get_known_areas()
             area_count = len(known_areas)
-
+ 
             # Test WebSocket if enabled
             ws_status = "disabled"
             if self.valves.USE_WEBSOCKET:
@@ -1302,7 +1316,7 @@ class Tools:
                     await self.close_ws()
                 except Exception as ws_error:
                     ws_status = f"failed: {str(ws_error)}"
-
+ 
             logger.info(f"✓ Connected to Home Assistant - {len(filtered)} entities, {area_count} areas (WebSocket: {ws_status})")
             return {
                 "status": "success",
@@ -1320,12 +1334,12 @@ class Tools:
                 "message": f"✗ Failed to connect to Home Assistant: {str(e)}\n"
                           f"Please check your HA_URL and HA_TOKEN configuration.",
             }
-
+ 
     async def list_areas(self, __event_emitter__: Callable[[dict], Any] = None) -> dict:
         """
         List all areas/rooms configured in Home Assistant.
         Useful for discovering what rooms are available.
-
+ 
         :return: JSON object with list of areas and their entities
         """
         if not self.valves.HA_URL or not self.valves.HA_TOKEN:
@@ -1333,7 +1347,7 @@ class Tools:
                 "error": "NOT_CONFIGURED",
                 "message": "Home Assistant is not configured."
             }
-
+ 
         try:
             if __event_emitter__:
                 await __event_emitter__(
@@ -1342,10 +1356,10 @@ class Tools:
                         "data": {"description": "Fetching areas and entities...", "done": False},
                     }
                 )
-
+ 
             # Build entity map with area info
             entity_map = await self._build_entity_map()
-
+ 
             # Group entities by area
             areas = {}
             for entity_id, entity_info in entity_map.items():
@@ -1361,16 +1375,16 @@ class Tools:
                     "domain": entity_info["domain"],
                     "state": entity_info["entity"].get("state", "unknown"),
                 })
-
+ 
             # Convert to list
             area_list = [
                 {"area_name": name, **data}
                 for name, data in areas.items()
             ]
-
+ 
             # Sort by area name
             area_list.sort(key=lambda x: x["area_name"])
-
+ 
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -1378,7 +1392,7 @@ class Tools:
                         "data": {"description": f"Found {len(area_list)} areas", "done": True},
                     }
                 )
-
+ 
             return {
                 "total_areas": len(area_list),
                 "areas": area_list,
@@ -1388,7 +1402,7 @@ class Tools:
                     "step_3": "Use the entity_id from the response to execute actions",
                 }
             }
-
+ 
         except Exception as e:
             error_msg = f"Error listing areas: {str(e)}"
             logger.error(error_msg)
@@ -1396,3 +1410,4 @@ class Tools:
                 "error": "EXCEPTION",
                 "message": error_msg
             }
+ 
