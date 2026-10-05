@@ -3,7 +3,7 @@ title: Home Assistant
 author: lexiismadd
 author_url: https://github.com/lexiismadd
 funding_url: https://github.com/open-webui
-version: 2.0.1
+version: 2.1.0
 license: MIT
 requirements: aiohttp, loguru
 description: Home Assistant tool with smart area-prioritized entity detection and intelligent matching.
@@ -53,6 +53,14 @@ class Tools:
         GLOBAL_FALLBACK_THRESHOLD: float = Field(
             default=0.5,
             description="Minimum score (0-1) for global search fallback to be considered a valid match.",
+        )
+        COMPACT_RESULTS: bool = Field(
+            default=False,
+            description="Return a compact control_home_assistant result (best match plus up to 4 alternatives, no explanations). Recommended for small local models with limited context.",
+        )
+        STATE_WAIT_SECONDS: float = Field(
+            default=1.5,
+            description="Seconds to wait after a state-changing service call before reading the entity's new state.",
         )
 
     def __init__(self):
@@ -903,6 +911,32 @@ class Tools:
                 }
             else:
                 best_match = top_matches[0]
+                if self.valves.COMPACT_RESULTS:
+                    result = {
+                        "best_match": {
+                            "entity_id": best_match["entity_id"],
+                            "friendly_name": best_match["friendly_name"],
+                            "area": best_match["area_name"],
+                            "state": best_match["entity"].get("state", "unknown"),
+                        },
+                        "other_matches": [
+                            {
+                                "entity_id": m["entity_id"],
+                                "friendly_name": m["friendly_name"],
+                                "state": m["entity"].get("state", "unknown"),
+                            }
+                            for m in top_matches[1:5]
+                        ],
+                        "next": "Use the EXACT entity_id with execute_action (get_state or call_service).",
+                    }
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {"description": f"Found {len(top_matches)} matching entities", "done": True},
+                            }
+                        )
+                    return result
                 detected_area_name = detected_area["area_name"] if detected_area else None
                 
                 result = {
@@ -1139,7 +1173,7 @@ class Tools:
 
                 # If this was a state-changing action, get the updated state
                 if service in ["turn_on", "turn_off", "toggle", "set_temperature", "set_brightness"]:
-                    await asyncio.sleep(1.5)  # Wait for state to update
+                    await asyncio.sleep(max(0.0, self.valves.STATE_WAIT_SECONDS))  # Wait for state to update
                     action_type = "get_state"
 
             if action_type == "get_state":
